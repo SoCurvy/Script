@@ -1,0 +1,331 @@
+-- Settings for ProfileService
+local SETTINGS = {
+
+	-- Interval in seconds for auto-saving profiles
+	AutoSaveProfiles = 30,
+	-- Cooldown time in seconds between successive DataStore calls for the same key
+	RobloxWriteCooldown = 7,
+	-- Maximum steps taken before a ForceLoad request steals the active session for a profile
+	ForceLoadMaxSteps = 8,
+	-- Time in seconds to assume a session lock is dead if a profile hasn't been updated
+	AssumeDeadSessionLock = 30 * 60,
+
+	-- Number of issues to collect before announcing a critical state
+	IssueCountForCriticalState = 5,
+	-- Time in seconds for the last issue
+	IssueLast = 120,
+	-- Time in seconds for the last critical state
+	CriticalStateLast = 120,
+
+	-- Technical metadata tags that should not be altered
+	MetaTagsUpdatedValues = {
+		ProfileCreateTime = true,
+		SessionLoadCount = true,
+		ActiveSession = true,
+		ForceLoadSession = true,
+		LastUpdate = true,
+	},
+	
+}
+
+-- Standalone Madwork reference for portable version of ProfileService
+local Madwork 
+do
+	-- Script signals and event handling
+	local MadworkScriptSignal = {}
+
+	local FreeRunnerThread = nil
+	
+	local function AcquireRunnerThreadAndCallEventHandler(fn, ...)
+		local acquired_runner_thread = FreeRunnerThread
+		FreeRunnerThread = nil
+		fn(...)
+		FreeRunnerThread = acquired_runner_thread
+	end
+	
+	local function RunEventHandlerInFreeThread(...)
+		AcquireRunnerThreadAndCallEventHandler(...)
+		while true do
+			AcquireRunnerThreadAndCallEventHandler(coroutine.yield())
+		end
+	end
+	
+	-- Connection object for script signals
+	local ScriptConnection = {
+	}
+	ScriptConnection.__index = ScriptConnection
+
+	function ScriptConnection:Disconnect()
+
+		if self._is_connected == false then
+			return
+		end
+
+		self._is_connected = false
+		self._script_signal._listener_count -= 1
+
+		if self._script_signal._head == self then
+			self._script_signal._head = self._next
+		else
+			local prev = self._script_signal._head
+			while prev ~= nil and prev._next ~= self do
+				prev = prev._next
+			end
+			if prev ~= nil then
+				prev._next = self._next
+			end
+		end
+
+		if self._disconnect_listener ~= nil then
+			if not FreeRunnerThread then
+				FreeRunnerThread = coroutine.create(RunEventHandlerInFreeThread)
+			end
+			task.spawn(FreeRunnerThread, self._disconnect_listener, self._disconnect_param)
+			self._disconnect_listener = nil
+		end
+
+	end
+	
+	-- Signal object for script signals
+	local ScriptSignal = {
+	}
+	ScriptSignal.__index = ScriptSignal
+
+	function ScriptSignal:Connect(listener, disconnect_listener, disconnect_param)
+
+		local script_connection = {
+			_listener = listener,
+			_script_signal = self,
+			_disconnect_listener = disconnect_listener,
+			_disconnect_param = disconnect_param,
+
+			_next = self._head,
+			_is_connected = true,
+		}
+		setmetatable(script_connection, ScriptConnection)
+
+		self._head = script_connection
+		self._listener_count += 1
+
+		return script_connection
+
+	end
+
+	function ScriptSignal:GetListenerCount()
+		return self._listener_count
+	end
+
+	function ScriptSignal:Fire(...)
+		local item = self._head
+		while item ~= nil do
+			if item._is_connected == true then
+				if not FreeRunnerThread then
+					FreeRunnerThread = coroutine.create(RunEventHandlerInFreeThread)
+				end
+				task.spawn(FreeRunnerThread, item._listener, ...)
+			end
+			item = item._next
+		end
+	end
+
+	function ScriptSignal:FireUntil(continue_callback, ...)
+		local item = self._head
+		while item ~= nil do
+			if item._is_connected == true then
+				item._listener(...)
+				if continue_callback() ~= true then
+					return
+				end
+			end
+			item = item._next
+		end
+	end
+
+	-- Create a new script signal
+	function MadworkScriptSignal.NewScriptSignal()
+		return {
+			_head = nil,
+			_listener_count = 0,
+			Connect = ScriptSignal.Connect,
+			GetListenerCount = ScriptSignal.GetListenerCount,
+			Fire = ScriptSignal.Fire,
+			FireUntil = ScriptSignal.FireUntil,
+		}
+	end
+	
+	-- Madwork framework namespace
+	Madwork = {
+		NewScriptSignal = MadworkScriptSignal.NewScriptSignal,
+		ConnectToOnClose = function(task, run_in_studio_mode)
+			if game:GetService("RunService"):IsStudio() == false or run_in_studio_mode == true then
+				game:BindToClose(task)
+			end
+		end,
+	}
+
+end
+
+-- ProfileService containing profile-related functionalities
+local ProfileService = {
+
+	-- Flag indicating if the service is locked (e.g., server shutting down)
+	ServiceLocked = false,
+
+	-- Signals for different events
+	IssueSignal = Madwork.NewScriptSignal(),
+	CorruptionSignal = Madwork.NewScriptSignal(),
+	CriticalState = false,
+	CriticalStateSignal = Madwork.NewScriptSignal(),
+
+	ServiceIssueCount = 0,
+
+	-- Active profile stores and auto-save list
+	_active_profile_stores = {},
+	_auto_save_list = {},
+	_issue_queue = {},
+	_critical_state_start = 0,
+
+	-- Mock data store for debugging
+	_mock_data_store = {},
+	_user_mock_data_store = {},
+
+	_use_mock_data_store = false,
+
+}
+
+-- Alias for active profile stores, auto-save list, and issue queue
+local ActiveProfileStores = ProfileService._active_profile_stores
+local AutoSaveList = ProfileService._auto_save_list
+local IssueQueue = ProfileService._issue_queue
+
+-- Get necessary services
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+
+-- Get PlaceId and JobId of the game
+local PlaceId = game.PlaceId
+local JobId = game.JobId
+
+-- Index for auto-saving profiles and last auto-save time
+local AutoSaveIndex = 1
+local LastAutoSave = os.clock()
+
+-- Index for loading profiles
+local LoadIndex = 0
+
+-- Counters for active profile load and save jobs
+local ActiveProfileLoadJobs = 0
+local ActiveProfileSaveJobs = 0
+
+-- Start time of critical state
+local CriticalStateStart = 0
+
+-- Check if running in Studio and whether live check is active
+local IsStudio = RunService:IsStudio()
+local IsLiveCheckActive = false
+
+-- Flag indicating whether to use mock data store for debugging
+local UseMockDataStore = false
+local MockDataStore = ProfileService._mock_data_store
+
+-- Separate mock data store accessed via ProfileStore.Mock
+local UserMockDataStore = ProfileService._user_mock_data_store
+local UseMockTag = {}
+
+-- Custom write queue for managing DataStore write calls
+local CustomWriteQueue = {
+}
+
+-- Deep copy a table
+local function DeepCopyTable(t)
+	local copy = {}
+	for key, value in pairs(t) do
+		if type(value) == "table" then
+			copy[key] = DeepCopyTable(value)
+		else
+			copy[key] = value
+		end
+	end
+	return copy
+end
+
+-- Reconcile target table with template
+local function ReconcileTable(target, template)
+	for k, v in pairs(template) do
+		if type(k) == "string" then
+			if target[k] == nil then
+				if type(v) == "table" then
+					target[k] = DeepCopyTable(v)
+				else
+					target[k] = v
+				end
+			elseif type(target[k]) == "table" and type(v) == "table" then
+				ReconcileTable(target[k], v)
+			end
+		end
+	end
+end
+
+-- Identify a profile for logging purposes
+local function IdentifyProfile(store_name, store_scope, key)
+	return string.format(
+		"[Store:\"%s\";%sKey:\"%s\"]",
+		store_name,
+		store_scope ~= nil and string.format("Scope:\"%s\";", store_scope) or "",
+		key
+	)
+end
+
+-- Cleanup custom write queue for a specific store and key
+local function CustomWriteQueueCleanup(store, key)
+	if CustomWriteQueue[store] ~= nil then
+		CustomWriteQueue[store][key] = nil
+		if next(CustomWriteQueue[store]) == nil then
+			CustomWriteQueue[store] = nil
+		end
+	end
+end
+
+-- Mark a custom write queue entry for cleanup after a certain time
+local function CustomWriteQueueMarkForCleanup(store, key)
+	if CustomWriteQueue[store] ~= nil then
+		if CustomWriteQueue[store][key] ~= nil then
+
+			local queue_data = CustomWriteQueue[store][key]
+			local queue = queue_data.Queue
+
+			if queue_data.CleanupJob == nil then
+
+				queue_data.CleanupJob = RunService.Heartbeat:Connect(function()
+					if os.clock() - queue_data.LastWrite > SETTINGS.RobloxWriteCooldown and #queue == 0 then
+						queue_data.CleanupJob:Disconnect()
+						CustomWriteQueueCleanup(store, key)
+					end
+				end)
+
+			end
+
+		elseif next(CustomWriteQueue[store]) == nil then
+			CustomWriteQueue[store] = nil
+		end
+	end
+end
+
+-- Asynchronously handle custom write queue
+local function CustomWriteQueueAsync(callback, store, key)
+
+	if CustomWriteQueue[store] == nil then
+		CustomWriteQueue[store] = {}
+	end
+	if CustomWriteQueue[store][key] == nil then
+		CustomWriteQueue[store][key] = {LastWrite = 0, Queue = {}, CleanupJob = nil}
+	end
+
+	local queue_data = CustomWriteQueue[store][key]
+	local queue = queue_data.Queue
+
+	table.insert(queue, callback)
+
+	CustomWriteQueueMarkForCleanup(store, key)
+
+end
